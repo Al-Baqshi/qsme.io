@@ -69,3 +69,96 @@ lib/
   chat-tools.ts         # AI SDK tool definitions
 ```
 # qsme.io
+
+## QSME domain contracts
+
+The repository now includes a dedicated QSME domain contract file at `lib/qsme-domain-types.ts` that mirrors the planned backend models for:
+
+- normalized geometry overlays (rooms, openings, symbols, measurements, notes)
+- page scale calibration and evidence anchors
+- quantity outputs, schedule rows, trade scopes, and rules profiles
+
+Use these interfaces when wiring API responses and autosave payloads so the workspace UI, extraction pipeline, and quantity engine all share one shape.
+
+## QSME FastAPI backend
+
+A backend scaffold now lives under `backend/` and follows the requested clean architecture:
+
+- `app/routers`: projects, documents, pages, overlays, quantities, exports
+- `app/services`: overlay, extraction, quantity services
+- `app/models`: SQLAlchemy PostgreSQL models
+- `app/schemas`: Pydantic domain schemas aligned to `lib/qsme-domain-types.ts`
+- `app/workers`: extraction worker entrypoint
+
+Run locally (after installing Python deps):
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r backend/requirements.txt
+PYTHONPATH=backend uvicorn app.main:app --reload
+```
+
+### Quantity engine
+
+The deterministic quantity engine is implemented in `backend/app/services/quantity_engine.py`.
+It computes floor area (shoelace), perimeter (scaled edges), skirting (perimeter - door widths), wall gross/net areas, and aggregated totals by level/project from room/opening/measurement overlays.
+
+### PDF extraction pipeline
+
+`backend/app/services/extraction_service.py` now implements a deterministic PDF extraction workflow using PyMuPDF, Pillow, and pytesseract:
+- store original uploaded PDF in object storage
+- split PDF into pages
+- render each page to PNG at 300 DPI
+- extract embedded text via PyMuPDF
+- run OCR fallback via Tesseract when embedded text is empty
+- classify page type (`floor_plan`, `elevation`, `section`, `site_plan`, `notes`, `schedule`)
+
+### Page scale calibration
+
+`POST /pages/{page_id}/scale` supports two calibration methods and stores per-page scale:
+- `method: "title_block"` parses text like `1:100` and computes `metersPerNormX/Y` from the rendered 300 DPI page image.
+- `method: "calibration"` uses two normalized points + real length (meters) to compute `metersPerNormX/Y`.
+
+### Trade agent framework
+
+`backend/app/services/trade_agents.py` provides trade-specific agents and a `BossAgent` orchestrator:
+- `FinishesAgent`
+- `SkirtingAgent`
+- `ElectricalAgent`
+- `PlumbingAgent`
+- `ConcreteAgent`
+
+Each agent reads overlays + base quantities from a project knowledge hub and returns `QuantityScheduleRow` outputs with overlay traceability and confidence scores. `BossAgent` merges all agent rows into a final `ProjectQuantitiesResponse`.
+
+### Project Knowledge Hub
+
+`backend/app/services/project_knowledge_hub.py` provides `get_project_context(project_id)` to return versioned project context for agent queries without reprocessing PDFs:
+- `project`
+- `documents`
+- `pages`
+- `overlays`
+- `quantities`
+- `issues`
+- `exports`
+
+The hub computes `contextVersion` and `needsRecompute` so quantities can be reused or recomputed when overlays change.
+
+### AI assistance layer
+
+`backend/app/services/ai_assist_service.py` adds assistive (non-authoritative) AI suggestions for:
+- page classification
+- room label detection
+- symbol recognition suggestions
+- issue detection
+
+AI outputs include confidence and suggested overlays flagged as `accepted=false` so users can accept/reject before persistence. The AI layer does **not** compute quantities.
+
+### Export engine
+
+`POST /projects/{project_id}/export` now supports:
+- `csv`
+- `xlsx`
+- `pdf`
+
+`backend/app/services/export_engine.py` generates exports containing room schedule, skirting schedule, electrical schedule, and project totals using `pandas`, `openpyxl`, and `reportlab`.
