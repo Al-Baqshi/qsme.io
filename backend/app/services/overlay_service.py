@@ -96,7 +96,7 @@ class OverlayService:
 
         typed_row = self._get_typed_row(overlay)
         geometry = dict((typed_row.geometry if typed_row else {}) or {})
-        metadata = dict((typed_row.metadata if typed_row else {}) or {})
+        metadata = dict((typed_row.meta_dict if typed_row else {}) or {})
 
         for key, value in updates.items():
             if key in OVERLAY_GEOMETRY_FIELDS[overlay.kind]:
@@ -156,11 +156,11 @@ class OverlayService:
     def _upsert_typed_overlay(self, overlay: Overlay, geometry: dict[str, Any], metadata: dict[str, Any]) -> None:
         typed = self._get_typed_row(overlay)
         if typed is None:
-            typed = TYPE_TABLE[overlay.kind](overlay_id=overlay.id, geometry=geometry, metadata=metadata)
+            typed = TYPE_TABLE[overlay.kind](overlay_id=overlay.id, geometry=geometry, meta_dict=metadata)
             self.db.add(typed)
         else:
             typed.geometry = geometry
-            typed.metadata = metadata
+            typed.meta_dict = metadata
             self.db.add(typed)
 
     def _add_revision(self, overlay: Overlay) -> None:

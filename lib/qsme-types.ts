@@ -47,6 +47,12 @@ export interface QSPage {
   number: number
   name: string
   imageUrl: string
+  /** Extracted text from the page (PDF text layer or OCR). Selectable in the UI for copy/analysis. */
+  textContent?: string | null
+  /** Layout-preserving blocks: table as table, note/dimensions labeled. For review and AI. */
+  structuredContent?: StructuredContentBlock[]
+  /** Extraction engine used: pp_structure_v3, paddle_basic, tesseract, pdf_text. */
+  extractionSource?: string | null
   tags: PageTag[]
   status: PageStatus
   rooms: QSRoom[]
@@ -56,6 +62,19 @@ export interface QSPage {
   scale: string | null
   confidence: number
 }
+
+/** Normalized bbox [x1,y1,x2,y2] 0-1 for highlighting on page image. */
+export type NormalizedBbox = [number, number, number, number]
+
+export type StructuredContentBlock = (
+  | { type: "paragraph"; content: string }
+  | { type: "note"; content: string }
+  | { type: "dimensions"; content: string }
+  | { type: "table"; content: string[][] }
+  | { type: "footer"; content: string | string[][] }
+  | { type: "list"; content: string[] }
+  | { type: "figure"; bbox?: NormalizedBbox; figureIndex?: number }
+) & { bbox?: NormalizedBbox }
 
 export interface QSRoom {
   id: string

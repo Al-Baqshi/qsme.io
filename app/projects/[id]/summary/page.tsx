@@ -1,6 +1,6 @@
 "use client"
 
-import { use } from "react"
+import { use, useState, useEffect, useCallback } from "react"
 import Link from "next/link"
 import {
   ChevronRight,
@@ -23,6 +23,8 @@ import {
   StickyNote,
   Shield,
   Building2,
+  Loader2,
+  AlertCircle,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -38,6 +40,11 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { getProject } from "@/lib/qsme-mock-data"
+import { getProjectContext, getProjectQuantities, exportProject, QSMEApiError } from "@/lib/qsme-api"
+import { contextToProject } from "@/lib/adapters/context-to-project"
+import type { QSProject } from "@/lib/qsme-types"
+
+const USE_MOCK_DATA = process.env.NEXT_PUBLIC_USE_MOCK_DATA === "true"
 
 export default function QSSummaryPage({
   params,
@@ -45,12 +52,59 @@ export default function QSSummaryPage({
   params: Promise<{ id: string }>
 }) {
   const { id } = use(params)
-  const project = getProject(id)
+  const [project, setProject] = useState<QSProject | null>(USE_MOCK_DATA ? getProject(id) ?? null : null)
+  const [loading, setLoading] = useState(!USE_MOCK_DATA)
+  const [error, setError] = useState<string | null>(null)
+  const [exporting, setExporting] = useState(false)
+
+  useEffect(() => {
+    if (USE_MOCK_DATA) return
+    setLoading(true)
+    setError(null)
+    Promise.all([getProjectContext(id), getProjectQuantities(id).catch(() => null)])
+      .then(([ctx, quantities]) => {
+        setProject(contextToProject(ctx, quantities))
+      })
+      .catch((err) => {
+        setError(err instanceof QSMEApiError ? err.message : "Failed to load project")
+      })
+      .finally(() => setLoading(false))
+  }, [id])
+
+  const handleExport = useCallback((format: "csv" | "pdf") => {
+    if (!project || USE_MOCK_DATA) return
+    setExporting(true)
+    setError(null)
+    exportProject(project.id, format)
+      .then((res) => {
+        if (res.downloadUri) window.open(res.downloadUri, "_blank")
+      })
+      .catch((err) => {
+        setError(err instanceof QSMEApiError ? err.message : "Export failed")
+      })
+      .finally(() => setExporting(false))
+  }, [project])
+
+  if (loading) {
+    return (
+      <main className="min-h-screen bg-background flex items-center justify-center">
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="h-10 w-10 text-muted-foreground animate-spin" />
+          <p className="text-sm text-muted-foreground">Loading summary...</p>
+        </div>
+      </main>
+    )
+  }
 
   if (!project) {
     return (
       <main className="min-h-screen bg-background flex items-center justify-center">
         <div className="text-center">
+          {error && (
+            <p className="text-sm text-destructive mb-2 flex items-center justify-center gap-2">
+              <AlertCircle className="h-4 w-4" /> {error}
+            </p>
+          )}
           <h1 className="text-xl font-bold text-foreground mb-2">Project Not Found</h1>
           <Link href="/projects" className="text-sm text-primary underline">
             Back to Projects
@@ -97,11 +151,23 @@ export default function QSSummaryPage({
           <span className="font-medium text-foreground shrink-0">QS Summary</span>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <Button variant="ghost" size="sm" className="text-xs text-muted-foreground h-7">
-            <Download className="h-3.5 w-3.5 mr-1" />
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-xs text-muted-foreground h-7"
+            onClick={() => handleExport("csv")}
+            disabled={exporting}
+          >
+            {exporting ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <Download className="h-3.5 w-3.5 mr-1" />}
             Export CSV
           </Button>
-          <Button variant="ghost" size="sm" className="text-xs text-muted-foreground h-7">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-xs text-muted-foreground h-7"
+            onClick={() => handleExport("pdf")}
+            disabled={exporting}
+          >
             <Download className="h-3.5 w-3.5 mr-1" />
             Export PDF
           </Button>

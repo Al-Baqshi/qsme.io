@@ -19,9 +19,9 @@ from app.schemas.quantity_schemas import (
     QuantityEngineInput,
     QuantityRulesProfile,
 )
+from app.application.quantity_engine import QuantityEngine
 from app.services.project_knowledge_hub import ProjectKnowledgeHubService
 from app.services.export_engine import ExportEngine
-from app.services.quantity_engine import QuantityEngine
 from app.services.trade_agents import BossAgent, build_project_knowledge_hub
 
 ROOM_ADAPTER = TypeAdapter(RoomOverlay)

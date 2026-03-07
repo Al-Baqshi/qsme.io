@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -18,7 +19,7 @@ class DocumentResponse(BaseModel):
     id: UUID
     projectId: UUID
     filename: str
-    storageUri: str | None
+    storageUri: Optional[str] = None
     status: str
     createdAt: datetime
 
@@ -26,9 +27,9 @@ class DocumentResponse(BaseModel):
 @router.post("/projects/{project_id}/documents", response_model=DocumentResponse)
 async def create_document(
     project_id: UUID,
-    file: UploadFile | None = File(default=None),
-    filename: str | None = Form(default=None),
-    storageUri: str | None = Form(default=None),
+    file: Optional[UploadFile] = File(default=None),
+    filename: Optional[str] = Form(default=None),
+    storageUri: Optional[str] = Form(default=None),
     db: Session = Depends(get_db),
 ) -> DocumentResponse:
     project = db.get(Project, project_id)
@@ -39,17 +40,24 @@ async def create_document(
     if not resolved_filename:
         raise HTTPException(status_code=400, detail="filename or file is required")
 
-    document = Document(project_id=project_id, filename=resolved_filename, storage_uri=storageUri)
+    document = Document(project_id=project_id, filename=resolved_filename, storage_uri=storageUri, status="uploaded")
     db.add(document)
     db.commit()
     db.refresh(document)
 
-    file_bytes = await file.read() if file else None
-    ExtractionService(db).process_document(
-        document,
-        pdf_bytes=file_bytes,
-        original_filename=resolved_filename,
-    )
+    if file and file.file:
+        file_bytes = await file.read()
+        if file_bytes:
+            ext_service = ExtractionService(db)
+            ext_service.store_pdf_only(
+                document,
+                file_bytes,
+                original_filename=resolved_filename,
+            )
+    elif storageUri:
+        db.refresh(document)
+    else:
+        raise HTTPException(status_code=400, detail="file or storageUri is required")
 
     return DocumentResponse(
         id=document.id,
@@ -59,3 +67,21 @@ async def create_document(
         status=document.status,
         createdAt=document.created_at,
     )
+
+
+class CreatePagesResponse(BaseModel):
+    pagesCreated: int
+
+
+@router.post("/documents/{document_id}/create-pages", response_model=CreatePagesResponse)
+def create_document_pages(document_id: UUID, db: Session = Depends(get_db)) -> CreatePagesResponse:
+    """Render PDF to page images so the document view can show pages. Call after upload. Does not run text/OCR extraction."""
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if not document.storage_uri:
+        raise HTTPException(status_code=400, detail="Document has no stored PDF")
+    if document.pages:
+        return CreatePagesResponse(pagesCreated=len(document.pages))
+    pages = ExtractionService(db).create_pages_from_pdf(document)
+    return CreatePagesResponse(pagesCreated=len(pages))

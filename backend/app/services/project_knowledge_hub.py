@@ -7,19 +7,8 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.domain.entities.context import ProjectContext
 from app.models.database_models import Document, ExportJob, Overlay, Page, Project, QuantitySnapshot
-
-
-class ProjectContext(BaseModel):
-    project: dict
-    documents: list[dict] = Field(default_factory=list)
-    pages: list[dict] = Field(default_factory=list)
-    overlays: list[dict] = Field(default_factory=list)
-    quantities: dict | None = None
-    issues: list[str] = Field(default_factory=list)
-    exports: list[dict] = Field(default_factory=list)
-    contextVersion: int
-    needsRecompute: bool
 
 
 class ProjectKnowledgeHubService:
@@ -115,7 +104,9 @@ class ProjectKnowledgeHubService:
                     "imageUrl": p.image_uri,
                     "detectedPageType": p.page_type,
                     "textContent": p.text_content,
+                    "structuredContent": p.structured_content or [],
                     "pageScale": p.page_scale,
+                    "extractionSource": getattr(p, "extraction_source", None),
                 }
                 for p in pages
             ],

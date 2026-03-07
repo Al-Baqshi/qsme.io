@@ -10,6 +10,8 @@ interface DrawingViewerProps {
   selectedAnnotationId: string | null
   selectedDimensionId: string | null
   onAnnotationClick: (id: string) => void
+  /** HTTP URL to the actual page image (e.g. from GET /pages/{id}/image). When set, this is drawn instead of the demo floor plan. */
+  pageImageUrl?: string | null
 }
 
 export function DrawingViewer({
@@ -19,12 +21,41 @@ export function DrawingViewer({
   selectedAnnotationId,
   selectedDimensionId,
   onAnnotationClick,
+  pageImageUrl,
 }: DrawingViewerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [isPanning, setIsPanning] = useState(false)
   const panStart = useRef({ x: 0, y: 0 })
+  const [loadedImage, setLoadedImage] = useState<HTMLImageElement | null>(null)
+  const loadedImageUrlRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (!pageImageUrl || !pageImageUrl.startsWith("http")) {
+      setLoadedImage(null)
+      loadedImageUrlRef.current = null
+      return
+    }
+    const url = pageImageUrl
+    if (loadedImageUrlRef.current === url) return
+    loadedImageUrlRef.current = url
+    const img = new Image()
+    img.onload = () => {
+      if (loadedImageUrlRef.current === url) setLoadedImage(img)
+    }
+    img.onerror = () => {
+      if (loadedImageUrlRef.current === url) {
+        setLoadedImage(null)
+        loadedImageUrlRef.current = null
+      }
+    }
+    img.src = url
+    return () => {
+      img.src = ""
+      if (loadedImageUrlRef.current === url) loadedImageUrlRef.current = null
+    }
+  }, [pageImageUrl])
 
   const paint = useCallback(() => {
     const canvas = canvasRef.current
@@ -41,27 +72,32 @@ export function DrawingViewer({
     const w = rect.width
     const h = rect.height
 
-    // background
-    ctx.fillStyle = "hsl(0 0% 97%)"
-    ctx.fillRect(0, 0, w, h)
+    const showingRealImage = Boolean(loadedImage)
 
-    // grid
-    ctx.strokeStyle = "hsl(0 0% 90%)"
-    ctx.lineWidth = 0.5
-    const gridSize = 20 * zoom
-    const offsetX = pan.x % gridSize
-    const offsetY = pan.y % gridSize
-    for (let x = offsetX; x < w; x += gridSize) {
-      ctx.beginPath()
-      ctx.moveTo(x, 0)
-      ctx.lineTo(x, h)
-      ctx.stroke()
-    }
-    for (let y = offsetY; y < h; y += gridSize) {
-      ctx.beginPath()
-      ctx.moveTo(0, y)
-      ctx.lineTo(w, y)
-      ctx.stroke()
+    // Background: neutral when showing page image, grid only for demo
+    if (showingRealImage) {
+      ctx.fillStyle = "hsl(0 0% 92%)"
+      ctx.fillRect(0, 0, w, h)
+    } else {
+      ctx.fillStyle = "hsl(0 0% 97%)"
+      ctx.fillRect(0, 0, w, h)
+      ctx.strokeStyle = "hsl(0 0% 90%)"
+      ctx.lineWidth = 0.5
+      const gridSize = 20 * zoom
+      const offsetX = pan.x % gridSize
+      const offsetY = pan.y % gridSize
+      for (let x = offsetX; x < w; x += gridSize) {
+        ctx.beginPath()
+        ctx.moveTo(x, 0)
+        ctx.lineTo(x, h)
+        ctx.stroke()
+      }
+      for (let y = offsetY; y < h; y += gridSize) {
+        ctx.beginPath()
+        ctx.moveTo(0, y)
+        ctx.lineTo(w, y)
+        ctx.stroke()
+      }
     }
 
     if (!page) {
@@ -72,28 +108,37 @@ export function DrawingViewer({
       return
     }
 
+    // Draw actual page image when available; otherwise fall back to demo floor plan
+    const hasImageUrl = Boolean(pageImageUrl && pageImageUrl.startsWith("http"))
+    const drawPageContent = loadedImage
+      ? () => drawPageImageScaled(ctx, loadedImage, w, h, zoom, pan)
+      : hasImageUrl
+      ? () => {
+          ctx.fillStyle = "hsl(0 0% 55%)"
+          ctx.font = "14px system-ui, sans-serif"
+          ctx.textAlign = "center"
+          ctx.fillText("Loading page image…", w / zoom / 2, h / zoom / 2)
+        }
+      : () => drawFloorPlan(ctx, page, w / zoom, h / zoom)
+
     ctx.save()
-    ctx.translate(pan.x, pan.y)
-    ctx.scale(zoom, zoom)
-
-    // draw floor plan representation
-    drawFloorPlan(ctx, page, w / zoom, h / zoom)
-
-    // draw dimensions
-    page.dimensions.forEach((dim) => {
-      const isSelected = dim.id === selectedDimensionId
-      drawDimension(ctx, dim, isSelected)
-    })
-
-    // draw annotations
-    page.annotations.forEach((ann) => {
-      const isSelected = ann.id === selectedAnnotationId
-      drawAnnotation(ctx, ann, isSelected)
-    })
-
-    // draw rooms overlay
-    drawRoomOverlays(ctx, page, w / zoom, h / zoom)
-
+    if (loadedImage) {
+      drawPageContent()
+    } else {
+      ctx.translate(pan.x, pan.y)
+      ctx.scale(zoom, zoom)
+      drawPageContent()
+      // overlays (dimensions, annotations, rooms) only for demo view
+      page.dimensions.forEach((dim) => {
+        const isSelected = dim.id === selectedDimensionId
+        drawDimension(ctx, dim, isSelected)
+      })
+      page.annotations.forEach((ann) => {
+        const isSelected = ann.id === selectedAnnotationId
+        drawAnnotation(ctx, ann, isSelected)
+      })
+      drawRoomOverlays(ctx, page, w / zoom, h / zoom)
+    }
     ctx.restore()
 
     // page info
@@ -104,7 +149,7 @@ export function DrawingViewer({
     ctx.textAlign = "right"
     if (page.scale) ctx.fillText(`Scale: ${page.scale}`, w - 12, h - 12)
     ctx.fillText(`${Math.round(zoom * 100)}%`, w - 12, h - 28)
-  }, [page, zoom, pan, selectedAnnotationId, selectedDimensionId])
+  }, [page, zoom, pan, selectedAnnotationId, selectedDimensionId, loadedImage, pageImageUrl])
 
   useEffect(() => {
     paint()
@@ -154,6 +199,47 @@ export function DrawingViewer({
 }
 
 // ── Drawing helpers ──
+
+/** Draw the page image so zoom and pan apply to the PDF: image scales with zoom, centered, fit-to-view at 100%. */
+function drawPageImageScaled(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  viewW: number,
+  viewH: number,
+  zoom: number,
+  pan: { x: number; y: number }
+) {
+  const iw = img.naturalWidth
+  const ih = img.naturalHeight
+  if (iw <= 0 || ih <= 0) return
+  const baseScale = Math.min(viewW / iw, viewH / ih)
+  const scale = baseScale * zoom
+  ctx.translate(viewW / 2 + pan.x, viewH / 2 + pan.y)
+  ctx.scale(scale, scale)
+  ctx.translate(-iw / 2, -ih / 2)
+  ctx.drawImage(img, 0, 0, iw, ih)
+}
+
+function drawPageImage(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  viewW: number,
+  viewH: number,
+  zoom: number,
+  _pan: { x: number; y: number }
+) {
+  const w2 = viewW / zoom
+  const h2 = viewH / zoom
+  const iw = img.naturalWidth
+  const ih = img.naturalHeight
+  if (iw <= 0 || ih <= 0) return
+  const scale = Math.min(w2 / iw, h2 / ih)
+  const drawW = iw * scale
+  const drawH = ih * scale
+  const x = (w2 - drawW) / 2
+  const y = (h2 - drawH) / 2
+  ctx.drawImage(img, x, y, drawW, drawH)
+}
 
 function drawFloorPlan(
   ctx: CanvasRenderingContext2D,
