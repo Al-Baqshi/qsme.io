@@ -1,13 +1,13 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useMemo, useState, useEffect } from "react"
 import type {
   QSPage,
   QSRoom,
   QSDimension,
   QSNote,
   QSAnnotation,
-  StructuredContentBlock,
+  StructuredExtractionItem,
   NormalizedBbox,
 } from "@/lib/qsme-types"
 import type { QSIssue } from "@/lib/qsme-types"
@@ -34,7 +34,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { getPageStructureJson } from "@/lib/qsme-api"
 
 interface ExtractionPanelProps {
   page: QSPage | null
@@ -47,6 +46,10 @@ interface ExtractionPanelProps {
   extractingPageId?: string | null
   /** When user clicks Locate on a block with bbox, highlight that region on the page image. */
   onLocateBlock?: (bbox: NormalizedBbox) => void
+  /** When a region is selected (e.g. from viewer click or Locate), pass its id for scroll-into-view. */
+  selectedRegionId?: string | null
+  /** Optional: sync selected region id when user clicks Locate on a card (so panel can highlight the card). */
+  onSelectRegion?: (id: string | null) => void
   /** Aspect ratio for layout-mimic view (width/height). Default 0.75 (portrait). */
   pageAspectRatio?: number
   /** When set, enables "Copy all pages (Markdown)" button. */
@@ -84,8 +87,16 @@ const ROOM_TYPE_LABELS: Record<string, string> = {
   other: "Other",
 }
 
+type LegacyStructuredBlock = {
+  type: "paragraph" | "table" | "figure"
+  content?: string | string[] | string[][]
+  bbox?: NormalizedBbox
+  figureIndex?: number
+  title?: string
+}
+
 /** Convert structured blocks to markdown for AI paste. */
-function blocksToMarkdown(blocks: StructuredContentBlock[]): string {
+function blocksToMarkdown(blocks: LegacyStructuredBlock[]): string {
   const parts: string[] = []
   for (const block of blocks) {
     if (block.type === "table") {
@@ -100,22 +111,6 @@ function blocksToMarkdown(blocks: StructuredContentBlock[]): string {
         }
         parts.push("")
       }
-    } else if (block.type === "list") {
-      const items = block.content as string[]
-      for (const item of items) {
-        parts.push(`- ${String(item).replace(/\n/g, " ")}`)
-      }
-      parts.push("")
-    } else if (block.type === "note") {
-      parts.push("## Note")
-      parts.push("")
-      parts.push(String(block.content))
-      parts.push("")
-    } else if (block.type === "dimensions") {
-      parts.push("## Dimensions")
-      parts.push("")
-      parts.push(String(block.content))
-      parts.push("")
     } else if (block.type === "figure") {
       parts.push("[Figure]")
       parts.push("")
@@ -151,9 +146,46 @@ function normalizeTableContent(raw: unknown): string[][] {
   return []
 }
 
+function toLegacyBlock(item: StructuredExtractionItem): LegacyStructuredBlock | null {
+  const text = item.normalized_text || item.raw_text || ""
+  if (item.region_type === "table_blocks") {
+    const rows = item.rows ?? item.table ?? (text ? text.split("\n").map((row) => row.split("\t")) : [])
+    return {
+      type: "table",
+      content: Array.isArray(rows) ? rows : [],
+      bbox: item.bbox,
+      figureIndex: item.figureIndex,
+      title: item.title ?? undefined,
+    }
+  }
+  if (item.region_type === "image_blocks" || item.region_type === "figure_blocks") {
+    return {
+      type: "figure",
+      bbox: item.bbox,
+      figureIndex: item.figureIndex,
+    }
+  }
+  return {
+    type: "paragraph",
+    content: text,
+    bbox: item.bbox,
+    figureIndex: item.figureIndex,
+  }
+}
+
 /** Sort blocks by reading order: top-to-bottom (y1), then left-to-right (x1). */
-function sortBlocksByReadingOrder(blocks: StructuredContentBlock[]): StructuredContentBlock[] {
+function sortBlocksByReadingOrder(blocks: LegacyStructuredBlock[]): LegacyStructuredBlock[] {
   return [...blocks].sort((a, b) => {
+    const ay = a.bbox?.[1] ?? 0
+    const by = b.bbox?.[1] ?? 0
+    if (Math.abs(ay - by) > 0.02) return ay - by
+    return (a.bbox?.[0] ?? 0) - (b.bbox?.[0] ?? 0)
+  })
+}
+
+/** Sort structured items by reading order (same key as blocks). */
+function sortItemsByReadingOrder(items: StructuredExtractionItem[]): StructuredExtractionItem[] {
+  return [...items].sort((a, b) => {
     const ay = a.bbox?.[1] ?? 0
     const by = b.bbox?.[1] ?? 0
     if (Math.abs(ay - by) > 0.02) return ay - by
@@ -173,7 +205,7 @@ function TableBlock({
   typeLabel: string
   LocateButton: React.ReactNode
   showTypeBadge?: boolean
-  block: StructuredContentBlock
+  block: LegacyStructuredBlock
 }) {
   const [expandOpen, setExpandOpen] = useState(false)
   const isKeyValue = normalizedRows[0]?.length === 2 && normalizedRows.length >= 1
@@ -221,12 +253,15 @@ function TableBlock({
                 {typeLabel}
               </Badge>
             )}
+            {"title" in block && block.title && (
+              <span className="text-xs font-medium text-foreground truncate">{block.title}</span>
+            )}
             <Button
               variant="ghost"
               size="sm"
               className="h-6 px-1.5 text-[10px] text-muted-foreground hover:text-foreground shrink-0"
               onClick={() => {
-                const md = blocksToMarkdown([{ type: "table", content: normalizedRows } as StructuredContentBlock])
+                const md = blocksToMarkdown([{ type: "table", content: normalizedRows } as LegacyStructuredBlock])
                 if (md) navigator.clipboard.writeText(md)
               }}
               aria-label="Copy table as Markdown"
@@ -260,7 +295,7 @@ function TableBlock({
               size="sm"
               className="shrink-0"
               onClick={() => {
-                const md = blocksToMarkdown([{ type: "table", content: normalizedRows } as StructuredContentBlock])
+                const md = blocksToMarkdown([{ type: "table", content: normalizedRows } as LegacyStructuredBlock])
                 if (md) navigator.clipboard.writeText(md)
               }}
             >
@@ -284,7 +319,7 @@ function StructuredBlockView({
   showTypeBadge,
   figureImageUrl,
 }: {
-  block: StructuredContentBlock
+  block: LegacyStructuredBlock
   index: number
   onLocate?: (bbox: NormalizedBbox) => void
   showTypeBadge?: boolean
@@ -452,22 +487,28 @@ function StructuredBlockView({
 
 function StructuredContentSection({
   blocks,
+  items,
   fallbackText,
   title,
   onLocate,
   showTypeBadge,
   pageImageBaseUrl,
   pageId,
+  selectedRegionId,
+  onSelectRegion,
 }: {
-  blocks: StructuredContentBlock[]
+  blocks: LegacyStructuredBlock[]
+  items?: StructuredExtractionItem[]
   fallbackText: string
   title?: string
   onLocate?: (bbox: NormalizedBbox) => void
   showTypeBadge?: boolean
   pageImageBaseUrl?: string | null
   pageId?: string | null
+  selectedRegionId?: string | null
+  onSelectRegion?: (id: string | null) => void
 }) {
-  const getFigureUrl = (block: StructuredContentBlock) => {
+  const getFigureUrl = (block: LegacyStructuredBlock) => {
     if (block.type !== "figure" || pageImageBaseUrl == null || pageId == null) return null
     const idx = "figureIndex" in block ? (block as { figureIndex?: number }).figureIndex : undefined
     if (typeof idx !== "number") return null
@@ -482,16 +523,33 @@ function StructuredContentSection({
             {title}
           </h4>
         )}
-        {blocks.map((block, i) => (
-          <StructuredBlockView
-            key={i}
-            block={block}
-            index={i}
-            onLocate={onLocate}
-            showTypeBadge={showTypeBadge}
-            figureImageUrl={block.type === "figure" ? getFigureUrl(block) : undefined}
-          />
-        ))}
+        {blocks.map((block, i) => {
+          const item = items?.[i]
+          const regionId = item?.id ?? `r${i}`
+          const isSelected = selectedRegionId === regionId
+          const onLocateWithRegion =
+            item && onLocate && onSelectRegion
+              ? (bbox: NormalizedBbox) => {
+                  onLocate(bbox)
+                  onSelectRegion(item.id ?? null)
+                }
+              : onLocate
+          return (
+            <div
+              key={regionId}
+              data-region-id={regionId}
+              className={isSelected ? "ring-1 ring-primary rounded-md" : ""}
+            >
+              <StructuredBlockView
+                block={block}
+                index={i}
+                onLocate={onLocateWithRegion}
+                showTypeBadge={showTypeBadge}
+                figureImageUrl={block.type === "figure" ? getFigureUrl(block) : undefined}
+              />
+            </div>
+          )
+        })}
       </div>
     )
   }
@@ -512,6 +570,8 @@ export function ExtractionPanel({
   onExtractPage,
   extractingPageId,
   onLocateBlock,
+  selectedRegionId,
+  onSelectRegion,
   pageAspectRatio = 0.75,
   allPages,
   pageImageBaseUrl,
@@ -526,38 +586,43 @@ export function ExtractionPanel({
     )
   }
 
-  const structured = page.structuredContent ?? []
-  const readingOrderBlocks = useMemo(() => sortBlocksByReadingOrder(structured), [structured])
+  const structuredItems = (page.structuredContent ?? []) as StructuredExtractionItem[]
+  const structuredLayoutItems = useMemo(
+    () => structuredItems.filter((item) => item.source !== "ocr"),
+    [structuredItems]
+  )
+  const rawOcrItems = useMemo(
+    () => structuredItems.filter((item) => item.source === "ocr"),
+    [structuredItems]
+  )
+  const tableItems = useMemo(
+    () => structuredItems.filter((item) => item.region_type === "table_blocks"),
+    [structuredItems]
+  )
+  const imageItems = useMemo(
+    () => structuredItems.filter((item) => item.region_type === "image_blocks" || item.region_type === "figure_blocks"),
+    [structuredItems]
+  )
+  const readingOrderBlocks = useMemo(
+    () =>
+      sortBlocksByReadingOrder(
+        structuredLayoutItems.map(toLegacyBlock).filter(Boolean) as LegacyStructuredBlock[]
+      ),
+    [structuredLayoutItems]
+  )
+  const readingOrderItems = useMemo(
+    () => sortItemsByReadingOrder(structuredLayoutItems),
+    [structuredLayoutItems]
+  )
   const [documentViewMode, setDocumentViewMode] = useState<"list" | "layout">("list")
-  const [structureJson, setStructureJson] = useState<string | null>(null)
-  const [structureJsonLoading, setStructureJsonLoading] = useState(false)
   const isExtractingThisPage = extractingPageId === page.id
   const needsExtraction = !page.textContent || (page.structuredContent?.length === 0)
 
   useEffect(() => {
-    if (!page?.id) return
-    let cancelled = false
-    setStructureJsonLoading(true)
-    setStructureJson(null)
-    getPageStructureJson(page.id)
-      .then((res) => {
-        if (cancelled) return
-        const raw = res.rawStructure
-        setStructureJson(
-          raw != null ? JSON.stringify(raw, null, 2) : JSON.stringify(page.structuredContent ?? [], null, 2)
-        )
-      })
-      .catch(() => {
-        if (cancelled) return
-        setStructureJson(JSON.stringify(page.structuredContent ?? [], null, 2))
-      })
-      .finally(() => {
-        if (!cancelled) setStructureJsonLoading(false)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [page?.id])
+    if (!selectedRegionId) return
+    const el = document.querySelector(`[data-region-id="${selectedRegionId}"]`)
+    el?.scrollIntoView({ behavior: "smooth", block: "nearest" })
+  }, [selectedRegionId])
 
   return (
     <>
@@ -565,7 +630,13 @@ export function ExtractionPanel({
         <div className="shrink-0 p-2 border-b border-border flex flex-col gap-1">
           {page.extractionSource && (
             <Badge variant="outline" className="text-[9px] px-1.5 py-0 h-5 w-fit text-muted-foreground">
-              {page.extractionSource === "pp_structure_v3"
+              {page.extractionSource === "paddle_structure"
+                ? "Paddle Structure"
+                : page.extractionSource === "embedded_text"
+                ? "Embedded text"
+                : page.extractionSource === "ocr"
+                ? "OCR"
+                : page.extractionSource === "pp_structure_v3"
                 ? "PP-StructureV3"
                 : page.extractionSource === "paddle_basic"
                 ? "Paddle"
@@ -597,21 +668,30 @@ export function ExtractionPanel({
           )}
         </div>
       )}
-    <Tabs defaultValue="document" className="h-full flex flex-col min-h-0">
+    <Tabs defaultValue="structured" className="h-full flex flex-col min-h-0">
       <div className="shrink-0 px-2 sm:px-3 py-2 border-b border-border">
-        <h3 className="text-sm font-semibold text-foreground">Document parsing</h3>
+        <h3 className="text-sm font-semibold text-foreground">Extraction results</h3>
       </div>
       <TabsList className="w-full shrink-0 justify-start rounded-none border-b border-border bg-transparent px-1 sm:px-2 gap-0 min-h-[44px] overflow-x-auto">
-        <TabsTrigger value="document" className="text-[10px] sm:text-xs data-[state=active]:bg-transparent data-[state=active]:shadow-none rounded-none border-b-2 border-transparent data-[state=active]:border-primary px-2 sm:px-3 py-2 min-h-[44px] shrink-0">
-          Document parsing
+        <TabsTrigger value="raw" className="text-[10px] sm:text-xs data-[state=active]:bg-transparent data-[state=active]:shadow-none rounded-none border-b-2 border-transparent data-[state=active]:border-primary px-2 sm:px-3 py-2 min-h-[44px] shrink-0">
+          Raw OCR
+        </TabsTrigger>
+        <TabsTrigger value="structured" className="text-[10px] sm:text-xs data-[state=active]:bg-transparent data-[state=active]:shadow-none rounded-none border-b-2 border-transparent data-[state=active]:border-primary px-2 sm:px-3 py-2 min-h-[44px] shrink-0">
+          Structured Layout
+        </TabsTrigger>
+        <TabsTrigger value="tables" className="text-[10px] sm:text-xs data-[state=active]:bg-transparent data-[state=active]:shadow-none rounded-none border-b-2 border-transparent data-[state=active]:border-primary px-2 sm:px-3 py-2 min-h-[44px] shrink-0">
+          Tables
+        </TabsTrigger>
+        <TabsTrigger value="images" className="text-[10px] sm:text-xs data-[state=active]:bg-transparent data-[state=active]:shadow-none rounded-none border-b-2 border-transparent data-[state=active]:border-primary px-2 sm:px-3 py-2 min-h-[44px] shrink-0">
+          Images
         </TabsTrigger>
         <TabsTrigger value="json" className="text-[10px] sm:text-xs data-[state=active]:bg-transparent data-[state=active]:shadow-none rounded-none border-b-2 border-transparent data-[state=active]:border-primary px-2 sm:px-3 py-2 min-h-[44px] shrink-0">
           JSON
         </TabsTrigger>
       </TabsList>
 
-      {/* Document parsing — figures, tables, text in reading order (PaddleOCR Studio style) */}
-      <TabsContent value="document" className="flex-1 m-0 overflow-hidden min-h-0">
+      {/* Structured layout — figures, tables, text in reading order */}
+      <TabsContent value="structured" className="flex-1 m-0 overflow-hidden min-h-0">
         <div className="p-2 sm:p-3 flex flex-col h-full gap-2">
           <div className="flex items-center justify-between gap-2">
             <p className="text-[10px] sm:text-xs text-muted-foreground flex-1 min-w-0">
@@ -640,11 +720,14 @@ export function ExtractionPanel({
                 <div className="pr-2 flex flex-col gap-2">
                   <StructuredContentSection
                     blocks={readingOrderBlocks}
+                    items={readingOrderItems}
                     fallbackText={page.textContent ?? "No content extracted. Click Extract this page."}
                     onLocate={onLocateBlock}
                     showTypeBadge
                     pageImageBaseUrl={pageImageBaseUrl}
                     pageId={page.id}
+                    selectedRegionId={selectedRegionId}
+                    onSelectRegion={onSelectRegion}
                   />
                 </div>
               </ScrollArea>
@@ -743,9 +826,11 @@ export function ExtractionPanel({
                 onClick={() => {
                   const parts: string[] = []
                   for (const p of allPages) {
-                    const blocks = p.structuredContent ?? []
-                    const sorted = sortBlocksByReadingOrder(blocks)
-                    parts.push(`## Page ${p.number}\n\n${blocks.length > 0 ? blocksToMarkdown(sorted) : (p.textContent ?? "")}`)
+                  const blocks = (p.structuredContent ?? [])
+                    .map(toLegacyBlock)
+                    .filter(Boolean) as LegacyStructuredBlock[]
+                  const sorted = sortBlocksByReadingOrder(blocks)
+                  parts.push(`## Page ${p.number}\n\n${blocks.length > 0 ? blocksToMarkdown(sorted) : (p.textContent ?? "")}`)
                   }
                   const md = parts.join("\n\n")
                   if (md) navigator.clipboard.writeText(md)
@@ -758,32 +843,88 @@ export function ExtractionPanel({
         </div>
       </TabsContent>
 
-      {/* JSON — raw PP-StructureV3 output or structuredContent fallback */}
+      {/* Raw OCR */}
+      <TabsContent value="raw" className="flex-1 m-0 overflow-hidden min-h-0">
+        <ScrollArea className="flex-1 min-h-0">
+          <div className="p-2 sm:p-3 flex flex-col gap-2">
+            {rawOcrItems.length === 0 ? (
+              <div className="text-xs text-muted-foreground rounded-md border border-border bg-muted/30 px-2 py-2">
+                No OCR-only blocks found.
+              </div>
+            ) : (
+              rawOcrItems.map((item, i) => {
+                const hasBbox = item.bbox && item.bbox.length >= 4
+                return (
+                  <div key={`ocr-${i}`} className="rounded-md border border-border bg-card px-2 py-2">
+                    <div className="flex items-center justify-between mb-1 gap-2">
+                      <Badge variant="outline" className="text-[9px] px-1.5 py-0 h-4 text-muted-foreground">
+                        OCR
+                      </Badge>
+                      <div className="flex items-center gap-2">
+                        <ConfidenceBadge value={Math.round((item.confidence || 0) * 100)} />
+                        {hasBbox && onLocateBlock ? (
+                          <button
+                            type="button"
+                            className="text-[10px] sm:text-xs text-muted-foreground hover:text-foreground flex items-center gap-0.5 min-h-[44px] sm:min-h-0 justify-center rounded-md hover:bg-muted/50 px-2"
+                            onClick={() => onLocateBlock(item.bbox as NormalizedBbox)}
+                          >
+                            <MapPin className="h-2.5 w-2.5" /> Locate
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                    <div className="text-xs text-foreground whitespace-pre-wrap break-words select-text">
+                      {item.raw_text || item.normalized_text || "—"}
+                    </div>
+                  </div>
+                )
+              })
+            )}
+          </div>
+        </ScrollArea>
+      </TabsContent>
+
+      {/* Tables */}
+      <TabsContent value="tables" className="flex-1 m-0 overflow-hidden min-h-0">
+        <ScrollArea className="flex-1 min-h-0">
+          <div className="p-2 sm:p-3 flex flex-col gap-2">
+            <StructuredContentSection
+              blocks={tableItems.map(toLegacyBlock).filter(Boolean) as LegacyStructuredBlock[]}
+              fallbackText="No tables extracted."
+              onLocate={onLocateBlock}
+              showTypeBadge
+              pageImageBaseUrl={pageImageBaseUrl}
+              pageId={page.id}
+            />
+          </div>
+        </ScrollArea>
+      </TabsContent>
+
+      {/* Images */}
+      <TabsContent value="images" className="flex-1 m-0 overflow-hidden min-h-0">
+        <ScrollArea className="flex-1 min-h-0">
+          <div className="p-2 sm:p-3 flex flex-col gap-2">
+            <StructuredContentSection
+              blocks={imageItems.map(toLegacyBlock).filter(Boolean) as LegacyStructuredBlock[]}
+              fallbackText="No images extracted."
+              onLocate={onLocateBlock}
+              showTypeBadge
+              pageImageBaseUrl={pageImageBaseUrl}
+              pageId={page.id}
+            />
+          </div>
+        </ScrollArea>
+      </TabsContent>
+
+      {/* JSON */}
       <TabsContent value="json" className="flex-1 m-0 overflow-hidden min-h-0">
-        <div className="p-2 sm:p-3 flex flex-col h-full gap-2">
-          <p className="text-[10px] sm:text-xs text-muted-foreground shrink-0">
-            Raw structure for this page. From PP-StructureV3 when available.
-          </p>
-          <ScrollArea className="flex-1 min-h-0">
-            <pre className="p-2 sm:p-3 text-[10px] sm:text-xs font-mono text-foreground whitespace-pre-wrap break-words select-all rounded-md border border-border bg-muted/30 overflow-auto min-h-0">
-              {structureJsonLoading ? (
-                <span className="flex items-center gap-2 text-muted-foreground">
-                  <Loader2 className="h-3 w-3 animate-spin" /> Loading…
-                </span>
-              ) : structureJson ?? "No structure data."
-              }
+        <ScrollArea className="flex-1 min-h-0">
+          <div className="p-2 sm:p-3">
+            <pre className="text-[10px] sm:text-xs font-mono text-muted-foreground whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-3 overflow-x-auto">
+              {JSON.stringify(page.structuredContent ?? [], null, 2)}
             </pre>
-          </ScrollArea>
-          <Button
-            variant="outline"
-            size="sm"
-            className="w-full text-xs min-h-[44px] sm:min-h-0 shrink-0"
-            onClick={() => structureJson && navigator.clipboard.writeText(structureJson)}
-            disabled={!structureJson}
-          >
-            <Copy className="h-3 w-3 mr-1" /> Copy JSON
-          </Button>
-        </div>
+          </div>
+        </ScrollArea>
       </TabsContent>
 
     </Tabs>

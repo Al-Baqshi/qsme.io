@@ -50,7 +50,7 @@ export interface QSPage {
   /** Extracted text from the page (PDF text layer or OCR). Selectable in the UI for copy/analysis. */
   textContent?: string | null
   /** Layout-preserving blocks: table as table, note/dimensions labeled. For review and AI. */
-  structuredContent?: StructuredContentBlock[]
+  structuredContent?: StructuredExtractionItem[]
   /** Extraction engine used: pp_structure_v3, paddle_basic, tesseract, pdf_text. */
   extractionSource?: string | null
   tags: PageTag[]
@@ -66,15 +66,38 @@ export interface QSPage {
 /** Normalized bbox [x1,y1,x2,y2] 0-1 for highlighting on page image. */
 export type NormalizedBbox = [number, number, number, number]
 
-export type StructuredContentBlock = (
-  | { type: "paragraph"; content: string }
-  | { type: "note"; content: string }
-  | { type: "dimensions"; content: string }
-  | { type: "table"; content: string[][] }
-  | { type: "footer"; content: string | string[][] }
-  | { type: "list"; content: string[] }
-  | { type: "figure"; bbox?: NormalizedBbox; figureIndex?: number }
-) & { bbox?: NormalizedBbox }
+export type ExtractionRegionType =
+  | "title_blocks"
+  | "text_blocks"
+  | "table_blocks"
+  | "image_blocks"
+  | "figure_blocks"
+  | "note"
+  | "drawing_area"
+
+export type StructuredExtractionItem = {
+  /** Stable region id (e.g. r0, r1). Fallback to index if missing. */
+  id?: string
+  page_id: string
+  page_number: number
+  bbox: NormalizedBbox
+  region_type: ExtractionRegionType
+  source: "embedded_text" | "paddle_structure" | "ocr"
+  confidence: number
+  raw_text: string
+  normalized_text: string
+  table?: string[][]
+  layout_label?: string
+  /** Table regions: title, headers, rows, markdown, html */
+  title?: string
+  headers?: string[]
+  rows?: string[][]
+  markdown?: string
+  html?: string
+  /** Image/figure regions: figureIndex and optional image_url */
+  figureIndex?: number
+  image_url?: string
+}
 
 export interface QSRoom {
   id: string

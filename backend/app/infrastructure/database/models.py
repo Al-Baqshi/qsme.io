@@ -47,7 +47,7 @@ class Page(Base):
     image_uri: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     page_type: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     text_content: Mapped[Optional[str]] = mapped_column(Text(), nullable=True)
-    """Structured extraction: list of { type: paragraph|table|note|dimensions|figure, content: string|string[][] }. Preserves layout for UI and AI."""
+    """Structured extraction: list of { region_type, bbox, source, raw_text, normalized_text, table? }. Preserves layout for UI and AI."""
     structured_content: Mapped[list] = mapped_column(JSONB, default=list)
     """Raw PP-StructureV3 predict() output for JSON tab. Null when not using structure mode."""
     raw_structure: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)

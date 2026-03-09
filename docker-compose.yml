@@ -1,0 +1,21 @@
+# QSME local development: one Postgres container, same DB every time.
+# Data persists in volume qsme_pgdata. Run from repo root:
+#   docker compose up -d
+#   # then run your backend (see README or scripts/run-with-db.sh)
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: qsme-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: qsme
+    ports:
+      - "5432:5432"
+    volumes:
+      - qsme_pgdata:/var/lib/postgresql/data
+
+volumes:
+  qsme_pgdata:

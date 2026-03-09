@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, use, useEffect, useCallback, useRef } from "react"
+import { useState, use, useEffect, useCallback, useRef, useMemo } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import {
@@ -68,6 +68,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { Progress } from "@/components/ui/progress"
 import { PageNavigator } from "@/components/qsme/page-navigator"
 import { DocumentScrollView } from "@/components/qsme/document-scroll-view"
+import type { DocumentScrollViewRegion } from "@/components/qsme/document-scroll-view"
 import { ExtractionPanel } from "@/components/qsme/extraction-panel"
 import { getProject } from "@/lib/qsme-mock-data"
 import { MOCK_ISSUES } from "@/lib/qsme-mock-data"
@@ -76,6 +77,7 @@ import { contextToProject, issuesToQSIssues } from "@/lib/adapters/context-to-pr
 import type { ProjectStatus } from "@/lib/qsme-types"
 import type { QSProject } from "@/lib/qsme-types"
 import type { QSIssue } from "@/lib/qsme-types"
+import type { StructuredExtractionItem } from "@/lib/qsme-types"
 
 const USE_MOCK_DATA = process.env.NEXT_PUBLIC_USE_MOCK_DATA === "true"
 
@@ -614,6 +616,8 @@ export default function ProjectDetailPage({
   const [selectedDimensionId, setSelectedDimensionId] = useState<string | null>(null)
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null)
   const [highlightBlockBbox, setHighlightBlockBbox] = useState<[number, number, number, number] | null>(null)
+  const [highlightPageId, setHighlightPageId] = useState<string | null>(null)
+  const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null)
 
   const allPages = project?.files?.flatMap((f) => f.pages) ?? []
   const effectivePageId =
@@ -623,9 +627,38 @@ export default function ProjectDetailPage({
         ? allPages[0].id
         : null
 
-  // Clear block highlight when selected page changes
+  const regionsByPageId = useMemo((): Record<string, DocumentScrollViewRegion[]> => {
+    const out: Record<string, DocumentScrollViewRegion[]> = {}
+    allPages.forEach((p) => {
+      const items = (p.structuredContent ?? []) as StructuredExtractionItem[]
+      out[p.id] = items
+        .filter((item) => Array.isArray(item.bbox) && item.bbox.length >= 4)
+        .map((item, i) => ({
+          id: item.id ?? `r${i}`,
+          region_type: item.region_type ?? "text_blocks",
+          bbox: item.bbox as [number, number, number, number],
+        }))
+    })
+    return out
+  }, [allPages])
+
+  const handleRegionClick = useCallback(
+    (regionId: string, bbox: [number, number, number, number], pageId: string) => {
+      setSelectedRegionId(regionId)
+      setHighlightBlockBbox(bbox)
+      setHighlightPageId(pageId)
+      setSelectedPageId(pageId)
+      setScrollToPageId(pageId)
+      setTimeout(() => setScrollToPageId(null), 800)
+    },
+    []
+  )
+
+  // Clear block highlight and selected region when selected page changes
   useEffect(() => {
     setHighlightBlockBbox(null)
+    setHighlightPageId(null)
+    setSelectedRegionId(null)
   }, [effectivePageId])
 
   // Keyboard shortcut: E to extract current page when it needs extraction
@@ -1033,7 +1066,10 @@ export default function ProjectDetailPage({
                 selectedPageId={effectivePageId}
                 scrollToPageId={scrollToPageId}
                 highlightBbox={highlightBlockBbox}
-                highlightPageId={effectivePageId ?? undefined}
+                highlightPageId={highlightPageId ?? effectivePageId ?? undefined}
+                regionsByPageId={regionsByPageId}
+                onRegionClick={handleRegionClick}
+                highlightRegionId={selectedRegionId}
               />
             </div>
 
@@ -1054,7 +1090,12 @@ export default function ProjectDetailPage({
                   selectedAnnotationId={selectedAnnotationId}
                   onExtractPage={handleExtractCurrentPage}
                   extractingPageId={extractingPageId}
-                  onLocateBlock={(bbox) => setHighlightBlockBbox(bbox)}
+                  onLocateBlock={(bbox) => {
+                    setHighlightBlockBbox(bbox)
+                    setHighlightPageId(effectivePageId)
+                  }}
+                  selectedRegionId={selectedRegionId}
+                  onSelectRegion={setSelectedRegionId}
                   pageImageBaseUrl={!USE_MOCK_DATA ? getBaseUrl() : undefined}
                 />
               </div>

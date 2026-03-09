@@ -92,11 +92,29 @@ A backend scaffold now lives under `backend/` and follows the requested clean ar
 
 Run locally (after installing Python deps):
 
+**Option A — Backend with Docker Postgres (same DB every time)**
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r backend/requirements.txt
-PYTHONPATH=backend uvicorn app.main:app --reload
+# From repo root: start Postgres and run the backend in one go
+yarn backend
+# Or: bash backend/scripts/run-with-db.sh
+```
+
+This starts Postgres in Docker (creates the `qsme` database on first run, keeps data in volume `qsme_pgdata`), waits for it to be ready, then starts uvicorn. No need to run `createdb qsme` manually.
+
+**Option B — Backend only (you run Postgres yourself)**
+
+```bash
+# Ensure Postgres is running with a database named qsme, then:
+cd backend && PYTHONPATH=. python -m uvicorn app.main:app --reload
+# Or set DATABASE_URL and run uvicorn from backend.
+```
+
+To start only the database (e.g. for running the backend in another terminal):
+
+```bash
+yarn db:up    # docker compose up -d db
+yarn db:down   # stop and remove containers (data in volume persists)
 ```
 
 ### Quantity engine

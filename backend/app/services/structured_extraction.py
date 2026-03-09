@@ -292,6 +292,8 @@ def structured_blocks_from_paddle_structure(
             if not isinstance(box, dict):
                 continue
             label = box.get("label", "text")
+            score = box.get("score")
+            score_value = float(score) if isinstance(score, (int, float)) else None
             coord = box.get("coordinate")
             if not coord or len(coord) < 4:
                 continue
@@ -325,28 +327,83 @@ def structured_blocks_from_paddle_structure(
                 # Try to get table structure from table_rec_res
                 table_rows = _extract_table_from_structure(res, box)
                 if table_rows:
-                    blocks_out.append({"type": "table", "content": table_rows, "bbox": bbox_norm})
+                    blocks_out.append(
+                        {
+                            "type": "table",
+                            "content": table_rows,
+                            "bbox": bbox_norm,
+                            "layout_label": label,
+                            "confidence": score_value,
+                        }
+                    )
                 elif content_str:
                     as_table = _lines_to_table(content_str.splitlines())
                     if as_table:
-                        blocks_out.append({"type": "table", "content": as_table, "bbox": bbox_norm})
+                        blocks_out.append(
+                            {
+                                "type": "table",
+                                "content": as_table,
+                                "bbox": bbox_norm,
+                                "layout_label": label,
+                                "confidence": score_value,
+                            }
+                        )
                     else:
                         block_type = _block_type_from_text(content_str)
-                        blocks_out.append({"type": block_type, "content": content_str, "bbox": bbox_norm})
+                        blocks_out.append(
+                            {
+                                "type": block_type,
+                                "content": content_str,
+                                "bbox": bbox_norm,
+                                "layout_label": label,
+                                "confidence": score_value,
+                            }
+                        )
                 else:
                     continue
             elif (label or "").lower() == "figure":
-                blocks_out.append({"type": "figure", "bbox": bbox_norm})
+                blocks_out.append(
+                    {
+                        "type": "figure",
+                        "bbox": bbox_norm,
+                        "layout_label": label,
+                        "confidence": score_value,
+                    }
+                )
             elif label == "list" and content_str:
                 lines = [ln.strip() for ln in content_str.splitlines() if ln.strip()]
                 if _is_list_block(lines):
-                    blocks_out.append({"type": "list", "content": _list_items(lines), "bbox": bbox_norm})
+                    blocks_out.append(
+                        {
+                            "type": "list",
+                            "content": _list_items(lines),
+                            "bbox": bbox_norm,
+                            "layout_label": label,
+                            "confidence": score_value,
+                        }
+                    )
                 else:
                     block_type = _block_type_from_text(content_str)
-                    blocks_out.append({"type": block_type, "content": content_str, "bbox": bbox_norm})
+                    blocks_out.append(
+                        {
+                            "type": block_type,
+                            "content": content_str,
+                            "bbox": bbox_norm,
+                            "layout_label": label,
+                            "confidence": score_value,
+                        }
+                    )
             elif content_str:
                 block_type = label_to_block.get(label, _block_type_from_text(content_str))
-                blocks_out.append({"type": block_type, "content": content_str, "bbox": bbox_norm})
+                blocks_out.append(
+                    {
+                        "type": block_type,
+                        "content": content_str,
+                        "bbox": bbox_norm,
+                        "layout_label": label,
+                        "confidence": score_value,
+                    }
+                )
 
         # Fallback: no layout boxes, use overall OCR with rec_polys for bbox per line
         if not blocks_out and rec_texts:
@@ -372,7 +429,12 @@ def structured_blocks_from_paddle_structure(
                     pb = _poly_to_bbox(b)
                     if pb:
                         bbox_norm = _normalize_bbox(pb, img_width, img_height)
-                blk: dict[str, Any] = {"type": _block_type_from_text(str(txt)), "content": str(txt).strip()}
+                blk: dict[str, Any] = {
+                    "type": _block_type_from_text(str(txt)),
+                    "content": str(txt).strip(),
+                    "layout_label": "ocr_text",
+                    "confidence": None,
+                }
                 if bbox_norm:
                     blk["bbox"] = bbox_norm
                 blocks_out.append(blk)

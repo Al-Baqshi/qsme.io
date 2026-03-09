@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
+import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Union
 from uuid import UUID
 
 import fitz
@@ -15,14 +17,13 @@ from sqlalchemy.orm import Session
 from app.models.database_models import Document, Page
 from app.services.ai_assist_service import AIAssistService
 from app.services.structured_extraction import (
-    merge_pdf_tables_with_blocks,
     structured_blocks_from_paddle_basic,
     structured_blocks_from_paddle_structure,
-    structured_blocks_from_pdf_dict,
-    structured_blocks_from_plain_text,
 )
 
 PageType = Literal["floor_plan", "elevation", "section", "site_plan", "notes", "schedule"]
+
+TITLE_RE = re.compile(r"\b(sheet|drawing|plan|floor plan|elevation|section|detail|title|scale)\b", re.IGNORECASE)
 
 
 class ExtractionService:
@@ -160,6 +161,522 @@ class ExtractionService:
         w, h = image.size
         return structured_blocks_from_paddle_basic(result, float(w), float(h))
 
+    def _normalize_bbox(self, bbox: list[float], width: float, height: float) -> list[float]:
+        if not bbox or len(bbox) < 4 or not width or not height:
+            return [0.0, 0.0, 0.0, 0.0]
+        x1, y1, x2, y2 = bbox[:4]
+        return [
+            max(0.0, min(1.0, x1 / width)),
+            max(0.0, min(1.0, y1 / height)),
+            max(0.0, min(1.0, x2 / width)),
+            max(0.0, min(1.0, y2 / height)),
+        ]
+
+    def _bbox_area(self, bbox: list[float]) -> float:
+        if not bbox or len(bbox) < 4:
+            return 0.0
+        return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+    def _bbox_overlaps(self, a: list[float], b: list[float], tol: float = 0.0) -> bool:
+        if not a or not b or len(a) < 4 or len(b) < 4:
+            return False
+        return not (
+            a[2] + tol < b[0]
+            or a[0] - tol > b[2]
+            or a[3] + tol < b[1]
+            or a[1] - tol > b[3]
+        )
+
+    def _union_bboxes(self, bboxes: list[list[float]]) -> list[float] | None:
+        if not bboxes:
+            return None
+        xs1 = [b[0] for b in bboxes if len(b) >= 4]
+        ys1 = [b[1] for b in bboxes if len(b) >= 4]
+        xs2 = [b[2] for b in bboxes if len(b) >= 4]
+        ys2 = [b[3] for b in bboxes if len(b) >= 4]
+        if not xs1 or not ys1 or not xs2 or not ys2:
+            return None
+        return [min(xs1), min(ys1), max(xs2), max(ys2)]
+
+    def _normalize_whitespace(self, text: str) -> str:
+        return re.sub(r"\s+", " ", text or "").strip()
+
+    def _standardize_units(self, text: str) -> str:
+        out = text or ""
+        out = re.sub(r"\bfeet\b|\bfoot\b", "ft", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bmeters?\b|\bmetres?\b", "m", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bcentimeters?\b|\bcentimetres?\b", "cm", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bmillimeters?\b|\bmillimetres?\b", "mm", out, flags=re.IGNORECASE)
+        out = re.sub(r"(\d+)\s*'\s*(\d+(?:\.\d+)?)\s*\"?", r"\1 ft \2 in", out)
+        out = re.sub(r"(?<=\d)\s*[\"”]", " in", out)
+        out = re.sub(r"(?<=\d)\s*['′]", " ft", out)
+        out = re.sub(r"(\d)(mm|cm|m|ft|in)\b", r"\1 \2", out, flags=re.IGNORECASE)
+        return out
+
+    def _fix_dimension_ocr(self, text: str) -> str:
+        out = text or ""
+        out = re.sub(r"(?<=\d)[oO](?=\d)", "0", out)
+        out = re.sub(r"(?<=\d)[Il](?=\d)", "1", out)
+        out = re.sub(r"(?<=\d)[S](?=\d)", "5", out)
+        out = re.sub(r"(?<=\d)[B](?=\d)", "8", out)
+        return out
+
+    def _normalize_text(self, text: str) -> str:
+        if not text:
+            return ""
+        out = self._fix_dimension_ocr(text)
+        out = self._standardize_units(out)
+        out = self._normalize_whitespace(out)
+        return out
+
+    def _is_title_text(self, text: str) -> bool:
+        return bool(TITLE_RE.search(text or ""))
+
+    def _extract_embedded_text_blocks(self, page: fitz.Page) -> list[dict[str, Any]]:
+        blocks_out: list[dict[str, Any]] = []
+        page_dict = page.get_text("dict") or {}
+        width = float(getattr(page.rect, "width", 0) or 0)
+        height = float(getattr(page.rect, "height", 0) or 0)
+        for blk in page_dict.get("blocks", []) or []:
+            if blk.get("type") != 0:
+                continue
+            bbox = blk.get("bbox")
+            if not bbox or len(bbox) < 4:
+                continue
+            lines = []
+            font_sizes: list[float] = []
+            for line in blk.get("lines") or []:
+                spans = line.get("spans") or []
+                line_text = " ".join((s.get("text") or "") for s in spans).strip()
+                if line_text:
+                    lines.append(line_text)
+                for span in spans:
+                    size = span.get("size")
+                    if isinstance(size, (int, float)):
+                        font_sizes.append(float(size))
+            if not lines:
+                continue
+            raw_text = "\n".join(lines).strip()
+            avg_size = sum(font_sizes) / len(font_sizes) if font_sizes else None
+            blocks_out.append(
+                {
+                    "bbox": self._normalize_bbox(bbox, width, height),
+                    "raw_text": raw_text,
+                    "line_count": len(lines),
+                    "avg_font_size": avg_size,
+                }
+            )
+        return blocks_out
+
+    def _embedded_region_type(self, text: str, bbox: list[float], avg_font_size: float | None) -> str:
+        if self._is_title_text(text):
+            return "title_blocks"
+        if avg_font_size is not None and avg_font_size >= 14:
+            return "title_blocks"
+        if bbox and len(bbox) >= 4 and bbox[1] > 0.8 and len(text.strip()) <= 120:
+            return "title_blocks"
+        return "text_blocks"
+
+    def _extract_embedded_table_blocks(self, page: fitz.Page) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        width = float(getattr(page.rect, "width", 0) or 0)
+        height = float(getattr(page.rect, "height", 0) or 0)
+        try:
+            finder = page.find_tables()
+            tables = getattr(finder, "tables", None) or []
+        except Exception:
+            tables = []
+        for t in tables:
+            try:
+                rows = t.extract()
+            except Exception:
+                rows = None
+            if not rows:
+                continue
+            table_rows = [[str(c) if c is not None else "" for c in row] for row in rows]
+            bbox = None
+            rect = getattr(t, "bbox", None) or getattr(t, "rect", None)
+            if rect is not None:
+                try:
+                    bbox = [float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3])]
+                except Exception:
+                    bbox = None
+            if bbox is None:
+                bbox = [0.0, 0.0, width, height]
+            out.append({"bbox": self._normalize_bbox(bbox, width, height), "table": table_rows})
+        return out
+
+    def _region_type_from_layout(self, label: str, block_type: str) -> str:
+        label_lower = (label or "").lower()
+        if label_lower in {"doc_title", "paragraph_title", "title"}:
+            return "title_blocks"
+        if label_lower in {"figure_caption", "figure_title"}:
+            return "figure_blocks"
+        if label_lower == "table" or block_type == "table":
+            return "table_blocks"
+        if label_lower == "figure" or block_type == "figure":
+            return "image_blocks"
+        return "text_blocks"
+
+    def _ocr_region_lines(
+        self,
+        image: Image.Image,
+        region_bbox: list[float],
+        page_width_px: int,
+        page_height_px: int,
+    ) -> list[dict[str, Any]]:
+        x1 = int(max(0.0, region_bbox[0]) * page_width_px)
+        y1 = int(max(0.0, region_bbox[1]) * page_height_px)
+        x2 = int(min(1.0, region_bbox[2]) * page_width_px)
+        y2 = int(min(1.0, region_bbox[3]) * page_height_px)
+        if x2 <= x1 or y2 <= y1:
+            return []
+        crop = image.crop((x1, y1, x2, y2))
+        try:
+            data = pytesseract.image_to_data(crop, output_type=pytesseract.Output.DICT)
+        except Exception:
+            data = None
+        if not data or "text" not in data:
+            text = (pytesseract.image_to_string(crop) or "").strip()
+            if not text:
+                return []
+            return [
+                {
+                    "text": text,
+                    "bbox": region_bbox,
+                    "confidence": 0.5,
+                }
+            ]
+        lines: dict[tuple[int, int, int], dict[str, Any]] = {}
+        count = len(data.get("text", []))
+        for i in range(count):
+            word = (data["text"][i] or "").strip()
+            if not word:
+                continue
+            try:
+                conf = float(data.get("conf", [])[i])
+            except (TypeError, ValueError):
+                conf = -1.0
+            left = int(data.get("left", [0])[i])
+            top = int(data.get("top", [0])[i])
+            width = int(data.get("width", [0])[i])
+            height = int(data.get("height", [0])[i])
+            key = (
+                int(data.get("block_num", [0])[i]),
+                int(data.get("par_num", [0])[i]),
+                int(data.get("line_num", [0])[i]),
+            )
+            entry = lines.setdefault(
+                key,
+                {"words": [], "confs": [], "bbox": [left, top, left + width, top + height]},
+            )
+            entry["words"].append(word)
+            if conf >= 0:
+                entry["confs"].append(conf)
+            bbox = entry["bbox"]
+            bbox[0] = min(bbox[0], left)
+            bbox[1] = min(bbox[1], top)
+            bbox[2] = max(bbox[2], left + width)
+            bbox[3] = max(bbox[3], top + height)
+
+        out: list[dict[str, Any]] = []
+        for entry in lines.values():
+            words = entry.get("words") or []
+            if not words:
+                continue
+            line_text = " ".join(words).strip()
+            if not line_text:
+                continue
+            confs = entry.get("confs") or []
+            confidence = sum(confs) / len(confs) / 100.0 if confs else 0.5
+            bbox = entry.get("bbox", [0, 0, 0, 0])
+            line_bbox = [
+                (x1 + bbox[0]) / page_width_px,
+                (y1 + bbox[1]) / page_height_px,
+                (x1 + bbox[2]) / page_width_px,
+                (y1 + bbox[3]) / page_height_px,
+            ]
+            out.append({"text": line_text, "bbox": line_bbox, "confidence": confidence})
+        return out
+
+    def _table_to_markdown(self, rows: list[list[str]]) -> str:
+        """Convert table rows to pipe markdown."""
+        if not rows:
+            return ""
+        escape = lambda s: str(s).replace("|", "\\|").replace("\n", " ")
+        header = "| " + " | ".join(escape(c) for c in rows[0]) + " |"
+        sep = "| " + " | ".join("---" for _ in rows[0]) + " |"
+        body = [header, sep]
+        for row in rows[1:]:
+            body.append("| " + " | ".join(escape(c) for c in row) + " |")
+        return "\n".join(body)
+
+    def _table_to_html(self, headers: list[str], rows: list[list[str]]) -> str:
+        """Convert headers + data rows to simple HTML table."""
+        import html
+        def esc(s: str) -> str:
+            return html.escape(str(s))
+        parts = ["<table>"]
+        if headers:
+            parts.append("<thead><tr>")
+            for h in headers:
+                parts.append(f"<th>{esc(h)}</th>")
+            parts.append("</tr></thead>")
+        parts.append("<tbody>")
+        for row in rows:
+            parts.append("<tr>")
+            for c in row:
+                parts.append(f"<td>{esc(c)}</td>")
+            parts.append("</tr>")
+        parts.append("</tbody></table>")
+        return "".join(parts)
+
+    def _infer_table_title(self, raw_text: str) -> Optional[str]:
+        """Infer table title from raw text (e.g. Sheet Index, Schedule)."""
+        lower = (raw_text or "").lower()
+        if "sheet index" in lower:
+            return "Sheet Index"
+        if "door schedule" in lower:
+            return "Door Schedule"
+        if "window schedule" in lower:
+            return "Window Schedule"
+        if "finish schedule" in lower:
+            return "Finish Schedule"
+        if "schedule" in lower and len(raw_text or "") < 80:
+            return (raw_text or "").strip().split("\n")[0].strip() or None
+        return None
+
+    def _enrich_table_region(self, item: dict[str, Any]) -> None:
+        """Mutate item: set title, headers, rows, markdown, html for table_blocks."""
+        if item.get("region_type") != "table_blocks":
+            return
+        table = item.get("table")
+        if not table or not isinstance(table, list):
+            return
+        rows = [list(map(str, row)) for row in table if isinstance(row, (list, tuple))]
+        if not rows:
+            return
+        item["headers"] = rows[0]
+        item["rows"] = rows[1:]
+        item["title"] = item.get("title") or self._infer_table_title(item.get("raw_text", ""))
+        item["markdown"] = self._table_to_markdown(rows)
+        item["html"] = self._table_to_html(rows[0], rows[1:])
+
+    def _crop_image_regions(
+        self,
+        structured_items: list[dict[str, Any]],
+        image: Image.Image,
+        document_id: UUID,
+        page_number: int,
+    ) -> None:
+        """Crop image/figure regions, save to storage, set figureIndex and image_url. Mutates items."""
+        idx = 0
+        for item in structured_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("region_type") not in ("image_blocks", "figure_blocks"):
+                continue
+            bbox = item.get("bbox")
+            if not bbox or len(bbox) < 4:
+                continue
+            try:
+                uri = self._store_figure_crop(document_id, page_number, idx, image, bbox)
+                if uri:
+                    item["figureIndex"] = idx
+                    # Relative path for API: client can use base + /pages/{page_id}/figures/{figureIndex}
+                    item["image_url"] = f"figures/page-{page_number}-{idx}.png"
+                    idx += 1
+            except Exception:
+                pass
+
+    def migrate_page_structured_content(self, page: Page) -> bool:
+        """Backfill region ids and table fields on existing structured_content. Mutates page in place; caller must commit.
+        Returns True if any change was made."""
+        content = list(page.structured_content or [])
+        if not content:
+            return False
+        changed = False
+        for i, item in enumerate(content):
+            if not isinstance(item, dict):
+                continue
+            if not item.get("id"):
+                item["id"] = f"r{i}"
+                changed = True
+            self._enrich_table_region(item)
+        # Always assign so table enrichment (headers, rows, markdown, etc.) is persisted
+        page.structured_content = content
+        return changed
+
+    def _build_extraction_item(
+        self,
+        *,
+        page_id: Union[UUID, str],
+        page_number: int,
+        bbox: list[float],
+        region_type: str,
+        source: str,
+        confidence: float,
+        raw_text: str,
+        table: list[list[str]] | None = None,
+        layout_label: str | None = None,
+    ) -> dict[str, Any]:
+        normalized = self._normalize_text(raw_text)
+        item: dict[str, Any] = {
+            "page_id": str(page_id),
+            "page_number": page_number,
+            "bbox": bbox,
+            "region_type": region_type,
+            "source": source,
+            "confidence": float(confidence),
+            "raw_text": raw_text,
+            "normalized_text": normalized,
+        }
+        if table is not None:
+            item["table"] = table
+        if layout_label:
+            item["layout_label"] = layout_label
+        return item
+
+    def _build_page_text_summary(self, items: list[dict[str, Any]]) -> str | None:
+        if not items:
+            return None
+        for region in ("title_blocks", "text_blocks"):
+            for item in items:
+                if item.get("region_type") == region and item.get("normalized_text"):
+                    return item["normalized_text"]
+        for item in items:
+            if item.get("normalized_text"):
+                return item["normalized_text"]
+        return None
+
+    def _build_detection_text(self, items: list[dict[str, Any]], limit: int = 6000) -> str:
+        parts = []
+        for item in items:
+            if item.get("region_type") in {"title_blocks", "text_blocks", "table_blocks", "figure_blocks"}:
+                text = item.get("normalized_text") or ""
+                if text:
+                    parts.append(text)
+        combined = "\n".join(parts).strip()
+        return combined[:limit]
+
+    def _extract_structured_content(
+        self,
+        *,
+        page: fitz.Page,
+        rendered: Image.Image,
+        page_id: Union[UUID, str],
+        page_number: int,
+    ) -> tuple[list[dict[str, Any]], str | None, str, str, dict | None]:
+        structured_items: list[dict[str, Any]] = []
+        raw_structure: dict | None = None
+
+        embedded_blocks = self._extract_embedded_text_blocks(page)
+        for blk in embedded_blocks:
+            raw_text = blk.get("raw_text", "")
+            bbox = blk.get("bbox") or [0.0, 0.0, 0.0, 0.0]
+            avg_font_size = blk.get("avg_font_size")
+            region_type = self._embedded_region_type(raw_text, bbox, avg_font_size)
+            structured_items.append(
+                self._build_extraction_item(
+                    page_id=page_id,
+                    page_number=page_number,
+                    bbox=bbox,
+                    region_type=region_type,
+                    source="embedded_text",
+                    confidence=0.98,
+                    raw_text=raw_text,
+                )
+            )
+
+        for tbl in self._extract_embedded_table_blocks(page):
+            table_rows = tbl.get("table") or []
+            raw_text = "\n".join(["\t".join(row) for row in table_rows if row])
+            structured_items.append(
+                self._build_extraction_item(
+                    page_id=page_id,
+                    page_number=page_number,
+                    bbox=tbl.get("bbox") or [0.0, 0.0, 0.0, 0.0],
+                    region_type="table_blocks",
+                    source="embedded_text",
+                    confidence=0.95,
+                    raw_text=raw_text,
+                    table=table_rows,
+                )
+            )
+
+        structure_blocks, _, raw_structure = self._run_ocr_with_structure(rendered)
+        for blk in structure_blocks or []:
+            block_type = blk.get("type", "paragraph")
+            layout_label = blk.get("layout_label") or block_type
+            region_type = self._region_type_from_layout(layout_label, block_type)
+            bbox = blk.get("bbox") or [0.0, 0.0, 0.0, 0.0]
+            confidence = blk.get("confidence")
+            if confidence is None:
+                confidence = 0.75
+
+            raw_text = ""
+            table_rows = None
+            if block_type == "table":
+                table_rows = blk.get("content") or []
+                raw_text = "\n".join(["\t".join(row) for row in table_rows if row])
+            elif block_type == "list":
+                raw_text = "\n".join([str(x) for x in (blk.get("content") or [])])
+            elif block_type != "figure":
+                raw_text = str(blk.get("content") or "")
+
+            structured_items.append(
+                self._build_extraction_item(
+                    page_id=page_id,
+                    page_number=page_number,
+                    bbox=bbox,
+                    region_type=region_type,
+                    source="paddle_structure",
+                    confidence=float(confidence),
+                    raw_text=raw_text,
+                    table=table_rows,
+                    layout_label=layout_label,
+                )
+            )
+
+        if not structure_blocks:
+            page_width_px, page_height_px = rendered.size
+            ocr_lines = self._ocr_region_lines(rendered, [0.0, 0.0, 1.0, 1.0], page_width_px, page_height_px)
+            for line in ocr_lines:
+                structured_items.append(
+                    self._build_extraction_item(
+                        page_id=page_id,
+                        page_number=page_number,
+                        bbox=line.get("bbox") or [0.0, 0.0, 0.0, 0.0],
+                        region_type="text_blocks",
+                        source="ocr",
+                        confidence=line.get("confidence", 0.5),
+                        raw_text=line.get("text", ""),
+                    )
+                )
+
+        structured_items = sorted(
+            structured_items,
+            key=lambda b: (
+                b.get("bbox", [0, 0, 0, 0])[1] if b.get("bbox") else 0,
+                b.get("bbox", [0, 0, 0, 0])[0] if b.get("bbox") else 0,
+            ),
+        )
+        for i, item in enumerate(structured_items):
+            item["id"] = f"r{i}"
+            self._enrich_table_region(item)
+        text_summary = self._build_page_text_summary(structured_items)
+        detection_text = self._build_detection_text(structured_items)
+        sources = {item.get("source") for item in structured_items}
+        if "paddle_structure" in sources:
+            extraction_source = "paddle_structure"
+        elif "embedded_text" in sources:
+            extraction_source = "embedded_text"
+        elif "ocr" in sources:
+            extraction_source = "ocr"
+        else:
+            extraction_source = ""
+        return structured_items, text_summary, detection_text, extraction_source, raw_structure
+
     def create_pages_from_pdf(self, document: Document) -> list[Page]:
         """Render PDF to page images and create Page records. No text/OCR/tables extraction.
         Call this on upload so the document view can show pages. Run process_document later for extraction."""
@@ -225,77 +742,20 @@ class ExtractionService:
 
                 existing = next((p for p in document.pages if p.page_number == page_index + 1), None)
 
-                extracted_text = (page.get_text("text") or "").strip()
-                use_paddle = os.getenv("USE_PADDLE_OCR", "false").strip().lower() == "true"
-                ocr_mode = os.getenv("PADDLE_OCR_MODE", "basic").strip().lower()
-
-                structured_content: list = []
-                ocr_text = ""
-                extraction_source: str | None = None
-                raw_structure: dict | None = None
-
-                if use_paddle and ocr_mode == "structure":
-                    try:
-                        structure_blocks, ocr_text, raw_structure = self._run_ocr_with_structure(rendered)
-                        if structure_blocks or ocr_text:
-                            structured_content = structure_blocks
-                            extraction_source = "pp_structure_v3"
-                            self._process_figure_blocks(
-                                structured_content, rendered, document.id, page_index + 1
-                            )
-                            if ocr_text:
-                                if len(extracted_text) < 250:
-                                    extracted_text = ocr_text
-                                else:
-                                    extracted_text = extracted_text + "\n\n" + ocr_text
-                    except Exception:
-                        pass
-
-                if not structured_content:
-                    if use_paddle and ocr_mode == "basic":
-                        try:
-                            paddle_blocks, ocr_text = self._run_ocr_with_paddle_basic(rendered)
-                            if paddle_blocks or ocr_text:
-                                structured_content = paddle_blocks
-                                extraction_source = "paddle_basic"
-                                if ocr_text:
-                                    if len(extracted_text) < 250:
-                                        extracted_text = ocr_text
-                                    else:
-                                        extracted_text = extracted_text + "\n\n" + ocr_text
-                        except Exception:
-                            pass
-                    if not structured_content:
-                        ocr_text = self._run_ocr(rendered)
-                        if ocr_text:
-                            if len(extracted_text) < 250:
-                                extracted_text = ocr_text
-                            else:
-                                extracted_text = extracted_text + "\n\n" + ocr_text
-                        try:
-                            d = page.get_text("dict")
-                            if d and d.get("blocks"):
-                                page_height = getattr(page.rect, "height", None) or 0
-                                blocks_from_dict = structured_blocks_from_pdf_dict(d, page_height=page_height)
-                            else:
-                                blocks_from_dict = structured_blocks_from_plain_text(extracted_text)
-                        except Exception:
-                            blocks_from_dict = structured_blocks_from_plain_text(extracted_text)
-                        pdf_tables: list[list[list[str]]] = []
-                        try:
-                            finder = page.find_tables()
-                            if getattr(finder, "tables", None):
-                                for t in finder.tables:
-                                    rows = t.extract()
-                                    if rows:
-                                        pdf_tables.append([[str(c) if c is not None else "" for c in row] for row in rows])
-                        except Exception:
-                            pass
-                        structured_content = merge_pdf_tables_with_blocks(pdf_tables, blocks_from_dict)
-                        extraction_source = "tesseract" if not use_paddle else "pdf_text"
-
-                detected_type = self._detect_page_type(extracted_text)
-                ai_result = self.ai_assist.analyze_page(text_content=extracted_text)
+                page_id = existing.id if existing else uuid.uuid4()
+                structured_content, text_summary, detection_text, extraction_source, raw_structure = (
+                    self._extract_structured_content(
+                        page=page,
+                        rendered=rendered,
+                        page_id=page_id,
+                        page_number=page_index + 1,
+                    )
+                )
+                self._crop_image_regions(
+                    structured_content, rendered, document.id, page_index + 1
+                )
+                detected_type = self._detect_page_type(detection_text)
+                ai_result = self.ai_assist.analyze_page(text_content=detection_text)
                 page_type = detected_type
                 if ai_result.pageClassification.confidence.score > 0.8 and detected_type == "notes":
                     page_type = ai_result.pageClassification.detectedPageType
@@ -303,7 +763,7 @@ class ExtractionService:
                 if existing:
                     if not existing.image_uri:
                         existing.image_uri = self._store_page_png(document.id, page_index + 1, rendered)
-                    existing.text_content = extracted_text
+                    existing.text_content = text_summary
                     existing.structured_content = structured_content
                     existing.raw_structure = raw_structure
                     existing.page_type = page_type
@@ -314,11 +774,12 @@ class ExtractionService:
                 else:
                     image_uri = self._store_page_png(document.id, page_index + 1, rendered)
                     page_row = Page(
+                        id=page_id,
                         document_id=document.id,
                         page_number=page_index + 1,
                         image_uri=image_uri,
                         page_type=page_type,
-                        text_content=extracted_text,
+                        text_content=text_summary,
                         structured_content=structured_content,
                         raw_structure=raw_structure,
                         tags=[page_type, "ai_assist"],
@@ -373,79 +834,23 @@ class ExtractionService:
             rendered = self._render_page_png(source, page_index)
             if not page.image_uri:
                 page.image_uri = self._store_page_png(document.id, page.page_number, rendered)
-            extracted_text = (p.get_text("text") or "").strip()
-            use_paddle = os.getenv("USE_PADDLE_OCR", "false").strip().lower() == "true"
-            ocr_mode = os.getenv("PADDLE_OCR_MODE", "basic").strip().lower()
-
-            structured_content = []
-            ocr_text = ""
-            extraction_source: str | None = None
-            raw_structure: dict | None = None
-            if use_paddle and ocr_mode == "structure":
-                try:
-                    structure_blocks, ocr_text, raw_structure = self._run_ocr_with_structure(rendered)
-                    if structure_blocks or ocr_text:
-                        structured_content = structure_blocks
-                        extraction_source = "pp_structure_v3"
-                        self._process_figure_blocks(
-                            structured_content, rendered, document.id, page.page_number
-                        )
-                        if ocr_text:
-                            if len(extracted_text) < 250:
-                                extracted_text = ocr_text
-                            else:
-                                extracted_text = extracted_text + "\n\n" + ocr_text
-                except Exception:
-                    pass
-
-            if not structured_content:
-                if use_paddle and ocr_mode == "basic":
-                    try:
-                        paddle_blocks, ocr_text = self._run_ocr_with_paddle_basic(rendered)
-                        if paddle_blocks or ocr_text:
-                            structured_content = paddle_blocks
-                            extraction_source = "paddle_basic"
-                            if ocr_text:
-                                if len(extracted_text) < 250:
-                                    extracted_text = ocr_text
-                                else:
-                                    extracted_text = extracted_text + "\n\n" + ocr_text
-                    except Exception:
-                        pass
-                if not structured_content:
-                    ocr_text = self._run_ocr(rendered)
-                    if ocr_text:
-                        if len(extracted_text) < 250:
-                            extracted_text = ocr_text
-                        else:
-                            extracted_text = extracted_text + "\n\n" + ocr_text
-                    try:
-                        d = p.get_text("dict")
-                        if d and d.get("blocks"):
-                            page_height = getattr(p.rect, "height", None) or 0
-                            blocks_from_dict = structured_blocks_from_pdf_dict(d, page_height=page_height)
-                        else:
-                            blocks_from_dict = structured_blocks_from_plain_text(extracted_text)
-                    except Exception:
-                        blocks_from_dict = structured_blocks_from_plain_text(extracted_text)
-                    pdf_tables = []
-                    try:
-                        finder = p.find_tables()
-                        if getattr(finder, "tables", None):
-                            for t in finder.tables:
-                                rows = t.extract()
-                                if rows:
-                                    pdf_tables.append([[str(c) if c is not None else "" for c in row] for row in rows])
-                    except Exception:
-                        pass
-                    structured_content = merge_pdf_tables_with_blocks(pdf_tables, blocks_from_dict)
-                    extraction_source = "tesseract" if not use_paddle else "pdf_text"
-            detected_type = self._detect_page_type(extracted_text)
-            ai_result = self.ai_assist.analyze_page(text_content=extracted_text)
+            structured_content, text_summary, detection_text, extraction_source, raw_structure = (
+                self._extract_structured_content(
+                    page=p,
+                    rendered=rendered,
+                    page_id=page.id,
+                    page_number=page.page_number,
+                )
+            )
+            self._crop_image_regions(
+                structured_content, rendered, document.id, page.page_number
+            )
+            detected_type = self._detect_page_type(detection_text)
+            ai_result = self.ai_assist.analyze_page(text_content=detection_text)
             page_type = detected_type
             if ai_result.pageClassification.confidence.score > 0.8 and detected_type == "notes":
                 page_type = ai_result.pageClassification.detectedPageType
-            page.text_content = extracted_text
+            page.text_content = text_summary
             page.structured_content = structured_content
             page.raw_structure = raw_structure
             page.page_type = page_type

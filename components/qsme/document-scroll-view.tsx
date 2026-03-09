@@ -4,6 +4,24 @@ import { useRef, useEffect, useState, useCallback } from "react"
 import type { QSPage, NormalizedBbox } from "@/lib/qsme-types"
 import { cn } from "@/lib/utils"
 
+/** Region type to overlay color (PaddleOCR-style). */
+const REGION_COLORS: Record<string, string> = {
+  table_blocks: "border-blue-500 bg-blue-500/20",
+  title_blocks: "border-green-600 bg-green-500/20",
+  text_blocks: "border-amber-500 bg-amber-500/20",
+  image_blocks: "border-violet-500 bg-violet-500/20",
+  figure_blocks: "border-red-500 bg-red-500/20",
+  note: "border-slate-400 bg-slate-400/20",
+  drawing_area: "border-slate-400 bg-slate-400/10",
+}
+const DEFAULT_REGION_COLOR = "border-slate-500 bg-slate-500/10"
+
+export interface DocumentScrollViewRegion {
+  id: string
+  region_type: string
+  bbox: NormalizedBbox
+}
+
 export interface DocumentScrollViewProps {
   pages: QSPage[]
   zoom: number
@@ -19,6 +37,12 @@ export interface DocumentScrollViewProps {
   highlightBbox?: NormalizedBbox | null
   /** Page id for which highlightBbox applies. */
   highlightPageId?: string | null
+  /** Regions per page for drawing colored boxes; key = page id. */
+  regionsByPageId?: Record<string, DocumentScrollViewRegion[]>
+  /** Called when user clicks a region box (regionId, bbox, pageId). */
+  onRegionClick?: (regionId: string, bbox: NormalizedBbox, pageId: string) => void
+  /** Region id to highlight with stronger border (e.g. selected or located). */
+  highlightRegionId?: string | null
 }
 
 export function DocumentScrollView({
@@ -30,6 +54,9 @@ export function DocumentScrollView({
   scrollToPageId,
   highlightBbox,
   highlightPageId,
+  regionsByPageId,
+  onRegionClick,
+  highlightRegionId,
 }: DocumentScrollViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
@@ -190,6 +217,31 @@ export function DocumentScrollView({
                           }}
                         />
                       )}
+                      {regionsByPageId?.[page.id]?.map((region) => {
+                        const bbox = region.bbox
+                        if (!bbox || bbox.length < 4) return null
+                        const isHighlight = highlightRegionId === region.id
+                        const colorClass = REGION_COLORS[region.region_type] ?? DEFAULT_REGION_COLOR
+                        return (
+                          <button
+                            key={region.id}
+                            type="button"
+                            className={cn(
+                              "absolute border cursor-pointer transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-1",
+                              colorClass,
+                              isHighlight && "ring-2 ring-primary ring-offset-1 border-primary opacity-100"
+                            )}
+                            style={{
+                              left: `${bbox[0] * 100}%`,
+                              top: `${bbox[1] * 100}%`,
+                              width: `${(bbox[2] - bbox[0]) * 100}%`,
+                              height: `${(bbox[3] - bbox[1]) * 100}%`,
+                            }}
+                            onClick={() => onRegionClick?.(region.id, bbox, page.id)}
+                            aria-label={`Region ${region.region_type}`}
+                          />
+                        )
+                      })}
                     </div>
                   ) : (
                     <div className="flex items-center justify-center w-full h-48 bg-muted text-muted-foreground text-sm">

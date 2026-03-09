@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.database_models import Document, Page
 from app.services.extraction_service import ExtractionService
+from app.schemas.extraction_schemas import StructuredExtractionResponse
 from app.schemas.overlay_schemas import NormalizedPoint
 from app.schemas.quantity_schemas import PageScale
 
@@ -37,7 +38,10 @@ def _image_uri_to_path(image_uri: Optional[str]) -> Path:
     else:
         path = Path(image_uri)
     if not path.exists():
-        raise HTTPException(status_code=404, detail="Page image file not found")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Page image file not found at {path}. Re-upload the PDF and run extraction to generate page images.",
+        )
     return path
 
 
@@ -126,6 +130,16 @@ def get_page_structure_json(page_id: UUID, db: Session = Depends(get_db)) -> Str
     if raw is None:
         return StructureJsonResponse(pageId=page.id, rawStructure=page.structured_content or [])
     return StructureJsonResponse(pageId=page.id, rawStructure=raw)
+
+
+@router.get("/pages/{page_id}/structured-extraction", response_model=StructuredExtractionResponse)
+def get_page_structured_extraction(page_id: UUID, db: Session = Depends(get_db)) -> StructuredExtractionResponse:
+    """Return structured extraction regions for the page (id, bbox, table shape, image_url)."""
+    page = db.get(Page, page_id)
+    if page is None:
+        raise HTTPException(status_code=404, detail="Page not found")
+    regions = [item for item in (page.structured_content or []) if isinstance(item, dict)]
+    return StructuredExtractionResponse(pageId=page.id, pageNumber=page.page_number, regions=regions)
 
 
 class ExtractPageResponse(BaseModel):
